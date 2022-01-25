@@ -1,0 +1,8 @@
+{
+    "rate" : 0.001, 
+    "gamma" : 0.9, 
+    "epsilon" : 0.9, 
+    "capacity" : 100000, 
+    "batch_size" : 128, 
+    "target_replace_iter" : 200
+}
