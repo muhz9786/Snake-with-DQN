@@ -342,7 +342,7 @@ class Agent:
         """
         choose an action depend on state.
 
-        if `greedy = False`, epsilon greedy will not be used. You could do it when testing.
+        if `greedy = False`, epsilon greedy will not be used. You could set it when testing.
 
         return a integer from [0, action_dim).
         """
