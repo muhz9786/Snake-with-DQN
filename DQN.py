@@ -1,44 +1,75 @@
-import random
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 import json
+
+class NoisyLinear(nn.Linear):
+    """
+    NoisyNet layer with factorized gaussian noise.
+    """
+    def __init__(self, in_features: int, out_features: int, bias: bool = True) -> None:
+        super().__init__(in_features, out_features, bias)
+        init_sigma = 0.4 / np.sqrt(in_features)
+        init_mu = 1 / np.sqrt(in_features)
+        self.sigma_w = nn.Parameter(torch.Tensor(out_features, in_features).fill_(init_sigma))
+        self.mu_w = nn.Parameter(torch.Tensor(out_features, in_features).normal_(std=init_mu))
+        if bias:
+            self.sigma_b = nn.Parameter(torch.Tensor(out_features).fill_(init_sigma))
+            self.mu_b = nn.Parameter(torch.Tensor(out_features).normal_(std=init_mu))
+        self.register_buffer("eps_p", torch.zeros((1, in_features)))
+        self.register_buffer("eps_q", torch.zeros((out_features, 1)))
+        
+    def forward(self, x):
+        func = lambda x: torch.mul(torch.sign(x), torch.sqrt(abs(x)))
+        # sample noisy network
+        torch.randn(self.eps_p.size(), out=self.eps_p)
+        torch.randn(self.eps_q.size(), out=self.eps_q)
+        epsilon_w = torch.mm(func(self.eps_q), func(self.eps_p)).detach()
+        weight = self.mu_w + torch.mul(epsilon_w, self.sigma_w)
+        if self.bias is not None:
+            epsilon_b = func(self.eps_q.T).detach()
+            bias = self.mu_b + torch.mul(epsilon_b, self.sigma_b)
+        return F.linear(x, weight, bias)
 
 class FCN(nn.Module):
     """
     fully connected network for Q-network.
     """
-    def __init__(self, state_dim, action_dim, dueling=False):
+    def __init__(self, state_dim, action_dim, dueling=False, noisy=False):
         """
         init a Q-network.
 
-        if `dueling=True`, it will be a Q-network of Dueling DQN.
+        if `dueling=True`, it will be the Q-network for Dueling DQN.
+        if `noisy=True`, it will be a NoisyNet.
         """
         super(FCN, self).__init__()
         self.dueling = dueling
+        self.Linear = NoisyLinear if noisy else nn.Linear
+
         self.feature = nn.Sequential(
-            nn.Linear(state_dim, 128),
+            self.Linear(state_dim, 128),
             nn.ReLU()
         )
 
         if self.dueling:
             self.advantage = nn.Sequential(
-                nn.Linear(128, 128),
+                self.Linear(128, 128),
                 nn.ReLU(),
-                nn.Linear(128, 1)
+                self.Linear(128, 1)
             )
             self.value = nn.Sequential(
-                nn.Linear(128, 128),
+                self.Linear(128, 128),
                 nn.ReLU(),
-                nn.Linear(128, action_dim)
+                self.Linear(128, action_dim)
             )
 
         else:
             self.value = nn.Sequential(
-                nn.Linear(128, 128),
+                self.Linear(128, 128),
                 nn.ReLU(),
-                nn.Linear(128, action_dim)
+                self.Linear(128, action_dim)
             )
 
     def forward(self, x):
@@ -68,7 +99,7 @@ class ISWeightMSELoss(nn.Module):
         mean(w * (x - y)^2)
         """
 
-        loss = torch.mean(w * torch.pow((x - y), 2))
+        loss = torch.mean(torch.mul(w, torch.pow((x - y), 2)))
         return loss
 
 class ReplayBuffer:
@@ -96,14 +127,15 @@ class ReplayBuffer:
             self.length += 1
         else:
             self.index = 0
-        self.buffer[self.index] = transition
+        self.memory[self.index] = transition
         self.index += 1
 
     def sample(self, batch_size):
         """
         sample a batch of transition
         """
-        batch = np.array(random.sample(self.buffer, batch_size))
+        sample_index = np.random.choice(self.length, batch_size)
+        batch = self.memory[sample_index]
         return batch
 
 class SumTree:
@@ -111,25 +143,26 @@ class SumTree:
     SumTree of Prioritized Replay, to store p and transition.
     """
 
-    def __init__(self, size, data_size):
+    def __init__(self, capacity, data_size):
         """
-        size: capacity of memory.
+        capacity: capacity of transition memory.
 
         data_size: dimension of transition.
         """
 
-        y = len(str(bin(size))) - 2
+        y = len(str(bin(capacity))) - 2
         self.index = 0
-        self.size = 2 ** y    # it should be a full binary tree.
-        self.tree = np.zeros(self.size * 2 - 1)
-        self.data = np.empty((size, data_size))
+        self.capacity = capacity
+        self.tree_size = 2 ** y    # it should be a full binary tree.
+        self.tree = np.zeros(self.tree_size * 2 - 1)
+        self.data = np.empty((self.capacity, data_size))
         self.update(0, 1)    # p1 = 1
 
     def append(self, data, p):
         """
         add data and it's p to SumTree.
         """
-        if self.index >= self.size:
+        if self.index >= self.capacity:
             self.index = 0
         self.data[self.index] = data
         self.update(self.index, p)
@@ -140,7 +173,7 @@ class SumTree:
         update all nodes of tree, with transition's p and it's index in data memory.
         """
 
-        index = self.size - 1 + index    # to index of tree.
+        index = self.tree_size - 1 + index    # to index of tree.
         delta = p - self.tree[index]
         self.tree[index] = p
         while index != 0:
@@ -158,7 +191,7 @@ class SumTree:
         """
 
         index = 0    # from top
-        while index < (self.size - 1):    # last layer: [n-1] ·········· [2n-1]
+        while index < (self.tree_size - 1):    # last layer: [n-1] ·········· [2n-1]
             left = index  * 2 + 1
             right = left + 1
             # left child
@@ -170,7 +203,7 @@ class SumTree:
                 index = right    
         
         p = self.tree[index]
-        index = index - self.size + 1
+        index = index - self.tree_size + 1
         data = self.data[index]
         return index, data, p
 
@@ -184,13 +217,13 @@ class SumTree:
         """
         max p of last layer.
         """
-        return np.max(self.tree[-self.size:])
+        return np.max(self.tree[-self.tree_size:])
 
     def get_min_p(self):
         """
         min p of last layer.
         """
-        min_p = np.min(self.tree[-self.size:])
+        min_p = np.min(self.tree[-self.tree_size:])
         return min_p if min_p != 0 else 1
 
 class PrioritizedReplayBuffer:
@@ -265,18 +298,20 @@ class Agent:
     """
     agent with DQN moudle.
     """
-    def __init__(self, state_dim, action_dim, cuda=False, dueling=False, prioritized=False):
+    def __init__(self, state_dim, action_dim, cuda=False, dueling=False, prioritized=False, noisy=False):
         """
         init an agent with DQN moudle.
 
         - if `cuda=True`, the GPU will be used if it is available.
         - if `dueling=True`, it will be with Dueling DQN moudle.
         - if `prioritized=True`, the replay buffer will be a Prioritized Replay Buffer.
+        - if `noisy=True`, the Q-network will be NoisyNet.
         """
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.is_dueling = dueling
         self.is_prioritized = prioritized
+        self.is_noisy = noisy
         self.train_cfg = {    # configuration of training.
             "rate" : 0.001, 
             "gamma" : 0.9, 
@@ -290,8 +325,8 @@ class Agent:
         else:
             self.device = torch.device("cpu")
 
-        self.predict_net = FCN(self.state_dim, action_dim, dueling=dueling).to(self.device)
-        self.target_net = FCN(self.state_dim, action_dim, dueling=dueling).to(self.device)
+        self.predict_net = FCN(self.state_dim, action_dim, dueling=dueling, noisy=noisy).to(self.device)
+        self.target_net = FCN(self.state_dim, action_dim, dueling=dueling, noisy=noisy).to(self.device)
         self.transition_size = self.state_dim * 2 + 3
         if prioritized:
             self.memory = PrioritizedReplayBuffer(self.train_cfg["capacity"], self.transition_size)
@@ -307,16 +342,18 @@ class Agent:
         """
         choose an action depend on state.
 
-        if `greedy = True`, epsilon greedy will be used.
+        if `greedy = False`, epsilon greedy will not be used. You could do it when testing.
 
-        return a integer from [0, action_dim]
+        return a integer from [0, action_dim).
         """
-        if np.random.rand() > (1 - self.train_cfg["epsilon"]) and greedy:
+        if not self.is_noisy and np.random.rand() > (1 - self.train_cfg["epsilon"]) and greedy:
             action = np.random.randint(self.action_dim)
         else:
-            state = torch.tensor([state], dtype=torch.float32, device=self.device)    # shape(1, state_dim)
-            q = self.predict_net(state)
-            action = q.max(1)[1].item()     # index
+            with torch.no_grad():
+                #disabling gradient calculation.
+                state = torch.tensor([state], dtype=torch.float32, device=self.device)    # shape(1, state_dim)
+                q = self.predict_net(state)
+                action = q.max(1)[1].item()     # index
         return action
 
     def update(self):
@@ -344,11 +381,13 @@ class Agent:
 
         q = self.predict_net(state_batch).gather(1, action_batch)
         next_q = self.target_net(next_state_batch).detach()
-        q_ = (reward_batch + self.train_cfg["gamma"] * next_q.max(1)[0] * (1 - terminated_batch)).unsqueeze(1)
+        #q_ = (reward_batch + self.train_cfg["gamma"] * next_q.max(1)[0] * (1 - terminated_batch)).unsqueeze(1)
+        Q = lambda r, gamma, next_q, done: torch.add(r, torch.mul(gamma, torch.mul(next_q, (1 - done))))    # maybe faster? XD
+        q_ = Q(reward_batch, self.train_cfg["gamma"], next_q.max(1)[0], terminated_batch).unsqueeze(1)
 
         if self.is_prioritized:
-            loss = self.loss(q, q_, ISWeight_batch)    # 1/m sum(wj * (q - q_)^2)
-            td_error = (q - q_).detach().cpu()    # copy data from GPU to CPU
+            loss = self.loss(q, q_, ISWeight_batch)    # 1/m * sum(wj * (q - q_)^2)
+            td_error = torch.sub(q, q_).detach().cpu()    # copy data from GPU to CPU
             td_error = td_error.numpy().T[0]    # to 1-dim array
             self.memory.update(index_batch, td_error)
         else:

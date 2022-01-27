@@ -12,9 +12,9 @@ if __name__ == "__main__":
 
     cfg = "./config.json"
 
-    chickpoint = "./checkpoint/checkpoint_d3qn_pri.pt"
+    chickpoint = "./checkpoint/comple.pt"
 
-    agent = DQN.Agent(state_dim, action_dim, cuda=True, dueling=True, prioritized=False)
+    agent = DQN.Agent(state_dim, action_dim, cuda=True, dueling=True, prioritized=True, noisy=True)
     agent.read_config(cfg)
 
     if os.path.exists(chickpoint):

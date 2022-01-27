@@ -9,9 +9,9 @@ if __name__ == "__main__":
     action_dim = env.action_dim
     state_dim = env.state_dim
 
-    chickpoint = "./checkpoint/checkpoint_d3qn_pri.pt"
+    chickpoint = "./checkpoint/comple.pt"
 
-    agent = DQN.Agent(state_dim, action_dim, dueling=True, prioritized=True)
+    agent = DQN.Agent(state_dim, action_dim, dueling=True, prioritized=True, noisy=True)
     if os.path.exists(chickpoint):
         agent.load(chickpoint)
     
